@@ -1,0 +1,520 @@
+const express = require('express');
+const { body, query, validationResult } = require('express-validator');
+const db = require('../database');
+const { authMiddleware, authorize } = require('../authMiddleware');
+
+const router = express.Router();
+
+// Helper function to get current stock level for a product
+async function getCurrentStock(productId, organizationId) {
+  const result = await db('inventory_transactions')
+    .where('product_id', productId)
+    .where('organization_id', organizationId)
+    .sum('quantity as total_stock')
+    .first();
+  
+  return parseFloat(result.total_stock) || 0;
+}
+
+// Helper function to check if stock level is low
+async function checkLowStock(productId, organizationId) {
+  const product = await db('products')
+    .where('id', productId)
+    .where('organization_id', organizationId)
+    .first();
+
+  if (!product || !product.track_inventory) {
+    return { isLowStock: false, currentStock: 0 };
+  }
+
+  const currentStock = await getCurrentStock(productId, organizationId);
+  
+  return {
+    isLowStock: currentStock <= product.min_stock_level,
+    currentStock,
+    minLevel: product.min_stock_level,
+    product: product
+  };
+}
+
+// Get all inventory transactions with filters
+router.get('/transactions', authMiddleware, [
+  query('page').optional().isInt({ min: 1 }).withMessage('Page must be positive integer'),
+  query('limit').optional().isInt({ min: 1, max: 100 }).withMessage('Limit must be 1-100'),
+  query('product_id').optional().isUUID().withMessage('Product ID must be valid UUID'),
+  query('transaction_type').optional().isIn(['purchase', 'sale', 'adjustment', 'transfer', 'return', 'damaged']).withMessage('Invalid transaction type'),
+  query('date_from').optional().isISO8601().withMessage('Date from must be valid ISO date'),
+  query('date_to').optional().isISO8601().withMessage('Date to must be valid ISO date')
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ 
+        error: 'Validation failed', 
+        details: errors.array() 
+      });
+    }
+
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 20;
+    const offset = (page - 1) * limit;
+    const { product_id, transaction_type, date_from, date_to } = req.query;
+
+    let query = db('inventory_transactions as it')
+      .select(
+        'it.id',
+        'it.quantity',
+        'it.previous_stock',
+        'it.new_stock',
+        'it.transaction_type',
+        'it.reference_number',
+        'it.notes',
+        'it.created_at',
+        'p.sku',
+        'p.name as product_name',
+        'u.first_name',
+        'u.last_name'
+      )
+      .join('products as p', 'it.product_id', '=', 'p.id')
+      .leftJoin('users as u', 'it.user_id', '=', 'u.id')
+      .where('it.organization_id', req.user.organization_id);
+
+    // Apply filters
+    if (product_id) {
+      query = query.where('it.product_id', product_id);
+    }
+
+    if (transaction_type) {
+      query = query.where('it.transaction_type', transaction_type);
+    }
+
+    if (date_from) {
+      query = query.where('it.created_at', '>=', new Date(date_from));
+    }
+
+    if (date_to) {
+      query = query.where('it.created_at', '<=', new Date(date_to));
+    }
+
+    // Get total count
+    const countQuery = query.clone().count('it.id as total');
+    const [{ total }] = await countQuery;
+    const totalTransactions = parseInt(total);
+
+    // Apply pagination and ordering
+    query = query
+      .orderBy('it.created_at', 'desc')
+      .limit(limit)
+      .offset(offset);
+
+    const transactions = await query;
+
+    // Calculate pagination metadata
+    const totalPages = Math.ceil(totalTransactions / limit);
+
+    res.json({
+      data: {
+        transactions,
+        pagination: {
+          current_page: page,
+          per_page: limit,
+          total: totalTransactions,
+          total_pages: totalPages,
+          has_next_page: page < totalPages,
+          has_prev_page: page > 1
+        }
+      }
+    });
+
+  } catch (error) {
+    console.error('Get transactions error:', error);
+    res.status(500).json({ 
+      error: 'Failed to fetch transactions', 
+      message: error.message 
+    });
+  }
+});
+
+// Create new inventory transaction
+router.post('/transactions', authMiddleware, [
+  body('product_id').isUUID().withMessage('Product ID must be valid UUID'),
+  body('quantity').isFloat().withMessage('Quantity must be a number'),
+  body('transaction_type').isIn(['purchase', 'sale', 'adjustment', 'transfer', 'return', 'damaged']).withMessage('Invalid transaction type'),
+  body('reference_number').optional().isLength({ max: 100 }).withMessage('Reference number too long'),
+  body('notes').optional().isLength({ max: 500 }).withMessage('Notes too long')
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ 
+        error: 'Validation failed', 
+        details: errors.array() 
+      });
+    }
+
+    const { 
+      product_id, 
+      quantity, 
+      transaction_type, 
+      reference_number, 
+      notes 
+    } = req.body;
+
+    // Validate product exists and belongs to user's organization
+    const product = await db('products')
+      .where('id', product_id)
+      .where('organization_id', req.user.organization_id)
+      .where('is_active', true)
+      .first();
+
+    if (!product) {
+      return res.status(404).json({ 
+        error: 'Product not found' 
+      });
+    }
+
+    if (!product.track_inventory) {
+      return res.status(400).json({ 
+        error: 'Inventory tracking is disabled for this product' 
+      });
+    }
+
+    // Validate quantity based on transaction type
+    if (transaction_type === 'sale' && quantity > 0) {
+      return res.status(400).json({ 
+        error: 'Sale transactions must have negative quantity' 
+      });
+    }
+
+    if (['purchase', 'adjustment', 'transfer', 'return'].includes(transaction_type) && quantity <= 0) {
+      return res.status(400).json({ 
+        error: `${transaction_type} transactions must have positive quantity` 
+      });
+    }
+
+    // Get current stock
+    const currentStock = await getCurrentStock(product_id, req.user.organization_id);
+    const newStock = currentStock + parseFloat(quantity);
+
+    // Check if new stock would be negative
+    if (newStock < 0 && transaction_type !== 'adjustment') {
+      return res.status(400).json({ 
+        error: 'Transaction would result in negative stock level',
+        current_stock: currentStock,
+        requested_quantity: quantity
+      });
+    }
+
+    // Check maximum stock level (if defined)
+    if (product.max_stock_level && newStock > product.max_stock_level) {
+      return res.status(400).json({ 
+        error: 'Transaction would exceed maximum stock level',
+        current_stock: currentStock,
+        max_stock_level: product.max_stock_level,
+        requested_quantity: quantity
+      });
+    }
+
+    // Create transaction in database
+    const [transaction] = await db('inventory_transactions')
+      .insert({
+        organization_id: req.user.organization_id,
+        product_id,
+        user_id: req.user.id,
+        quantity: parseFloat(quantity),
+        previous_stock: currentStock,
+        new_stock: newStock,
+        transaction_type,
+        reference_number,
+        notes
+      })
+      .returning('*');
+
+    // Check for low stock alert
+    const stockCheck = await checkLowStock(product_id, req.user.organization_id);
+
+    res.status(201).json({
+      message: 'Inventory transaction recorded successfully',
+      data: {
+        transaction,
+        stock_info: {
+          previous_stock: currentStock,
+          new_stock: newStock,
+          current_stock: newStock,
+          low_stock_alert: stockCheck.isLowStock,
+          product_name: product.name,
+          sku: product.sku
+        }
+      }
+    });
+
+    // TODO: Send low stock notification if needed
+    if (stockCheck.isLowStock) {
+      // This would trigger email/SMS notification
+      console.log(`Low stock alert for ${product.name} (SKU: ${product.sku})`);
+    }
+
+  } catch (error) {
+    console.error('Create transaction error:', error);
+    res.status(500).json({ 
+      error: 'Failed to create transaction', 
+      message: error.message 
+    });
+  }
+});
+
+// Get products with low stock
+router.get('/low-stock', authMiddleware, async (req, res) => {
+  try {
+    const products = await db('products as p')
+      .select(
+        'p.id',
+        'p.sku',
+        'p.name',
+        'p.min_stock_level',
+        'p.reorder_point',
+        'p.reorder_quantity',
+        'c.name as category_name',
+        db.raw('COALESCE(stock_summary.current_stock, 0) as current_stock')
+      )
+      .leftJoin('categories as c', 'p.category_id', '=', 'c.id')
+      .leftJoin(
+        db.raw(`
+          (SELECT 
+            product_id, 
+            SUM(CASE WHEN quantity > 0 THEN quantity ELSE 0 END) as current_stock
+          FROM inventory_transactions 
+          WHERE organization_id = ?
+          GROUP BY product_id) as stock_summary
+        `),
+        'p.id', '=', 'stock_summary.product_id'
+      )
+      .where('p.organization_id', req.user.organization_id)
+      .where('p.is_active', true)
+      .where('p.track_inventory', true)
+      .havingRaw('COALESCE(stock_summary.current_stock, 0) <= p.min_stock_level')
+      .orderByRaw('COALESCE(stock_summary.current_stock, 0) - p.min_stock_level', 'asc');
+
+    // Calculate priority and action needed
+    const lowStockProducts = products.map(product => {
+      const currentStock = parseFloat(product.current_stock);
+      const minLevel = parseFloat(product.min_stock_level);
+      const difference = currentStock - minLevel;
+      
+      let priority = 'normal';
+      if (difference <= -50) priority = 'critical';
+      else if (difference <= -20) priority = 'high';
+      else if (difference <= -5) priority = 'medium';
+
+      return {
+        ...product,
+        current_stock: currentStock,
+        min_stock_level: minLevel,
+        stock_difference: difference,
+        priority,
+        action_needed: difference < 0
+      };
+    });
+
+    res.json({
+      data: {
+        low_stock_products: lowStockProducts,
+        summary: {
+          total_low_stock: lowStockProducts.length,
+          critical_count: lowStockProducts.filter(p => p.priority === 'critical').length,
+          high_count: lowStockProducts.filter(p => p.priority === 'high').length,
+          medium_count: lowStockProducts.filter(p => p.priority === 'medium').length
+        }
+      }
+    });
+
+  } catch (error) {
+    console.error('Get low stock error:', error);
+    res.status(500).json({ 
+      error: 'Failed to fetch low stock products', 
+      message: error.message 
+    });
+  }
+});
+
+// Get current stock levels for all products
+router.get('/stock-levels', authMiddleware, async (req, res) => {
+  try {
+    const stockLevels = await db('products as p')
+      .select(
+        'p.id',
+        'p.sku',
+        'p.name',
+        'p.min_stock_level',
+        'p.max_stock_level',
+        'p.reorder_point',
+        'p.reorder_quantity',
+        'p.unit_of_measure',
+        'c.name as category_name',
+        db.raw('COALESCE(stock_summary.current_stock, 0) as current_stock'),
+        db.raw('COALESCE(stock_summary.last_transaction_date, \'\' ) as last_transaction_date')
+      )
+      .leftJoin('categories as c', 'p.category_id', '=', 'c.id')
+      .leftJoin(
+        db.raw(`
+          (SELECT 
+            product_id,
+            SUM(CASE WHEN quantity > 0 THEN quantity ELSE 0 END) as current_stock,
+            MAX(created_at) as last_transaction_date
+          FROM inventory_transactions 
+          WHERE organization_id = ?
+          GROUP BY product_id) as stock_summary
+        `),
+        'p.id', '=', 'stock_summary.product_id'
+      )
+      .where('p.organization_id', req.user.organization_id)
+      .where('p.is_active', true)
+      .orderBy('p.name', 'asc');
+
+    // Add status indicators
+    const productsWithStatus = stockLevels.map(product => {
+      const currentStock = parseFloat(product.current_stock);
+      const minLevel = parseFloat(product.min_stock_level);
+      const maxLevel = parseFloat(product.max_stock_level) || Infinity;
+
+      let status = 'normal';
+      if (currentStock <= minLevel) status = 'low_stock';
+      if (currentStock >= maxLevel) status = 'overstocked';
+      if (currentStock <= minLevel / 2) status = 'critical';
+
+      return {
+        ...product,
+        current_stock: currentStock,
+        min_stock_level: minLevel,
+        max_stock_level: maxLevel,
+        stock_status: status
+      };
+    });
+
+    res.json({
+      data: {
+        stock_levels: productsWithStatus,
+        summary: {
+          total_products: productsWithStatus.length,
+          normal_stock: productsWithStatus.filter(p => p.stock_status === 'normal').length,
+          low_stock: productsWithStatus.filter(p => p.stock_status === 'low_stock').length,
+          critical_stock: productsWithStatus.filter(p => p.stock_status === 'critical').length,
+          overstocked: productsWithStatus.filter(p => p.stock_status === 'overstocked').length
+        }
+      }
+    });
+
+  } catch (error) {
+    console.error('Get stock levels error:', error);
+    res.status(500).json({ 
+      error: 'Failed to fetch stock levels', 
+      message: error.message 
+    });
+  }
+});
+
+// Bulk stock adjustment
+router.post('/bulk-adjustment', authMiddleware, authorize('admin', 'manager'), [
+  body('adjustments').isArray({ min: 1 }).withMessage('Adjustments array is required'),
+  body('adjustments.*.product_id').isUUID().withMessage('Product ID must be valid UUID'),
+  body('adjustments.*.quantity').isFloat().withMessage('Quantity must be a number'),
+  body('adjustments.*.transaction_type').isIn(['adjustment']).withMessage('Transaction type must be adjustment'),
+  body('adjustments.*.notes').optional().isLength({ max: 500 }).withMessage('Notes too long')
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ 
+        error: 'Validation failed', 
+        details: errors.array() 
+      });
+    }
+
+    const { adjustments } = req.body;
+    const results = {
+      success: [],
+      errors: []
+    };
+
+    for (let i = 0; i < adjustments.length; i++) {
+      const adjustment = adjustments[i];
+      try {
+        const { product_id, quantity, notes } = adjustment;
+
+        // Validate product exists and belongs to user's organization
+        const product = await db('products')
+          .where('id', product_id)
+          .where('organization_id', req.user.organization_id)
+          .where('is_active', true)
+          .first();
+
+        if (!product) {
+          results.errors.push({
+            row: i + 1,
+            product_id,
+            error: 'Product not found or inactive'
+          });
+          continue;
+        }
+
+        if (!product.track_inventory) {
+          results.errors.push({
+            row: i + 1,
+            product_id,
+            sku: product.sku,
+            error: 'Inventory tracking disabled for this product'
+          });
+          continue;
+        }
+
+        // Get current stock
+        const currentStock = await getCurrentStock(product_id, req.user.organization_id);
+        const newStock = currentStock + parseFloat(quantity);
+
+        // Create transaction
+        const [transaction] = await db('inventory_transactions')
+          .insert({
+            organization_id: req.user.organization_id,
+            product_id,
+            user_id: req.user.id,
+            quantity: parseFloat(quantity),
+            previous_stock: currentStock,
+            new_stock: newStock,
+            transaction_type: 'adjustment',
+            notes: notes || 'Bulk adjustment'
+          })
+          .returning('*');
+
+        results.success.push({
+          row: i + 1,
+          product_id,
+          sku: product.sku,
+          transaction_id: transaction.id,
+          previous_stock: currentStock,
+          new_stock: newStock
+        });
+
+      } catch (error) {
+        results.errors.push({
+          row: i + 1,
+          product_id: adjustment.product_id,
+          error: error.message
+        });
+      }
+    }
+
+    res.json({
+      message: `Bulk adjustment completed. ${results.success.length} adjustments processed, ${results.errors.length} errors.`,
+      data: results
+    });
+
+  } catch (error) {
+    console.error('Bulk adjustment error:', error);
+    res.status(500).json({ 
+      error: 'Bulk adjustment failed', 
+      message: error.message 
+    });
+  }
+});
+
+module.exports = router;

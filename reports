@@ -1,0 +1,522 @@
+const express = require('express');
+const { query, validationResult } = require('express-validator');
+const db = require('../database');
+const { authMiddleware } = require('../authMiddleware');
+
+const router = express.Router();
+
+// Get dashboard overview statistics
+router.get('/dashboard', authMiddleware, async (req, res) => {
+  try {
+    const organizationId = req.user.organization_id;
+
+    // Get current stock overview
+    const [stockOverview] = await db.raw(`
+      SELECT 
+        COUNT(DISTINCT p.id) as total_products,
+        COALESCE(SUM(CASE WHEN stock_summary.current_stock > 0 THEN stock_summary.current_stock ELSE 0 END), 0) as total_stock_value,
+        COALESCE(SUM(CASE WHEN stock_summary.current_stock > 0 THEN stock_summary.current_stock * p.cost_price ELSE 0 END), 0) as total_inventory_value,
+        COUNT(CASE WHEN stock_summary.current_stock <= p.min_stock_level THEN 1 END) as low_stock_count,
+        COUNT(CASE WHEN stock_summary.current_stock = 0 THEN 1 END) as out_of_stock_count
+      FROM products p
+      LEFT JOIN (
+        SELECT 
+          product_id, 
+          SUM(CASE WHEN quantity > 0 THEN quantity ELSE 0 END) as current_stock
+        FROM inventory_transactions 
+        WHERE organization_id = ?
+        GROUP BY product_id
+      ) stock_summary ON p.id = stock_summary.product_id
+      WHERE p.organization_id = ? AND p.is_active = true
+    `, [organizationId, organizationId]);
+
+    // Get recent transaction activity (last 30 days)
+    const [recentActivity] = await db.raw(`
+      SELECT 
+        COUNT(*) as total_transactions,
+        SUM(CASE WHEN transaction_type = 'purchase' THEN quantity ELSE 0 END) as total_purchases,
+        SUM(CASE WHEN transaction_type = 'sale' THEN ABS(quantity) ELSE 0 END) as total_sales,
+        COUNT(CASE WHEN DATE(created_at) = CURRENT_DATE THEN 1 END) as today_transactions
+      FROM inventory_transactions 
+      WHERE organization_id = ? AND created_at >= CURRENT_DATE - INTERVAL '30 days'
+    `, [organizationId]);
+
+    // Get low stock alerts
+    const lowStockAlerts = await db.raw(`
+      SELECT 
+        p.id,
+        p.sku,
+        p.name,
+        p.min_stock_level,
+        COALESCE(stock_summary.current_stock, 0) as current_stock,
+        (COALESCE(stock_summary.current_stock, 0) - p.min_stock_level) as difference,
+        c.name as category_name
+      FROM products p
+      LEFT JOIN categories c ON p.category_id = c.id
+      LEFT JOIN (
+        SELECT 
+          product_id, 
+          SUM(CASE WHEN quantity > 0 THEN quantity ELSE 0 END) as current_stock
+        FROM inventory_transactions 
+        WHERE organization_id = ?
+        GROUP BY product_id
+      ) stock_summary ON p.id = stock_summary.product_id
+      WHERE p.organization_id = ? AND p.is_active = true
+        AND COALESCE(stock_summary.current_stock, 0) <= p.min_stock_level
+      ORDER BY (COALESCE(stock_summary.current_stock, 0) - p.min_stock_level) ASC
+      LIMIT 10
+    `, [organizationId, organizationId]);
+
+    // Get supplier statistics
+    const [supplierStats] = await db.raw(`
+      SELECT 
+        COUNT(*) as total_suppliers,
+        COUNT(CASE WHEN s.is_active = true THEN 1 END) as active_suppliers
+      FROM suppliers s
+      WHERE s.organization_id = ?
+    `, [organizationId]);
+
+    // Get recent purchase orders
+    const recentPurchaseOrders = await db('purchase_orders as po')
+      .select(
+        'po.id',
+        'po.order_number',
+        'po.order_date',
+        'po.status',
+        'po.total_amount',
+        's.name as supplier_name'
+      )
+      .join('suppliers as s', 'po.supplier_id', '=', 's.id')
+      .where('po.organization_id', organizationId)
+      .orderBy('po.created_at', 'desc')
+      .limit(5);
+
+    res.json({
+      data: {
+        overview: {
+          total_products: parseInt(stockOverview.total_products),
+          total_stock_value: parseFloat(stockOverview.total_stock_value),
+          total_inventory_value: parseFloat(stockOverview.total_inventory_value),
+          low_stock_count: parseInt(stockOverview.low_stock_count),
+          out_of_stock_count: parseInt(stockOverview.out_of_stock_count)
+        },
+        activity: {
+          total_transactions: parseInt(recentActivity.total_transactions),
+          total_purchases: parseFloat(recentActivity.total_purchases),
+          total_sales: parseFloat(recentActivity.total_sales),
+          today_transactions: parseInt(recentActivity.today_transactions)
+        },
+        suppliers: {
+          total_suppliers: parseInt(supplierStats.total_suppliers),
+          active_suppliers: parseInt(supplierStats.active_suppliers)
+        },
+        alerts: {
+          low_stock: lowStockAlerts.rows || []
+        },
+        recent_orders: recentPurchaseOrders
+      }
+    });
+
+  } catch (error) {
+    console.error('Dashboard overview error:', error);
+    res.status(500).json({ 
+      error: 'Failed to fetch dashboard overview', 
+      message: error.message 
+    });
+  }
+});
+
+// Get inventory value report
+router.get('/inventory-value', authMiddleware, [
+  query('category_id').optional().isUUID().withMessage('Category ID must be valid UUID'),
+  query('as_of_date').optional().isISO8601().withMessage('Date must be valid ISO date')
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ 
+        error: 'Validation failed', 
+        details: errors.array() 
+      });
+    }
+
+    const { category_id, as_of_date } = req.query;
+    const organizationId = req.user.organization_id;
+
+    let query = db.raw(`
+      SELECT 
+        p.id,
+        p.sku,
+        p.name,
+        p.cost_price,
+        p.selling_price,
+        COALESCE(stock_summary.current_stock, 0) as current_stock,
+        (COALESCE(stock_summary.current_stock, 0) * p.cost_price) as total_cost_value,
+        (COALESCE(stock_summary.current_stock, 0) * p.selling_price) as total_selling_value,
+        c.name as category_name
+      FROM products p
+      LEFT JOIN categories c ON p.category_id = c.id
+      LEFT JOIN (
+        SELECT 
+          product_id, 
+          SUM(CASE WHEN quantity > 0 THEN quantity ELSE 0 END) as current_stock
+        FROM inventory_transactions 
+        WHERE organization_id = ?
+        GROUP BY product_id
+      ) stock_summary ON p.id = stock_summary.product_id
+      WHERE p.organization_id = ? AND p.is_active = true
+    `, [organizationId, organizationId]);
+
+    if (category_id) {
+      query = query.where('p.category_id', category_id);
+    }
+
+    if (as_of_date) {
+      // For future implementation - filter transactions by date
+      query = query.andWhere('it.created_at', '<=', new Date(as_of_date));
+    }
+
+    const inventoryReport = await query;
+
+    // Calculate summary
+    const summary = inventoryReport.rows.reduce((acc, item) => {
+      acc.total_products += 1;
+      acc.total_cost_value += parseFloat(item.total_cost_value);
+      acc.total_selling_value += parseFloat(item.total_selling_value);
+      acc.total_current_stock += parseFloat(item.current_stock);
+      return acc;
+    }, {
+      total_products: 0,
+      total_cost_value: 0,
+      total_selling_value: 0,
+      total_current_stock: 0
+    });
+
+    // Group by category for category breakdown
+    const categoryBreakdown = {};
+    inventoryReport.rows.forEach(item => {
+      const category = item.category_name || 'Uncategorized';
+      if (!categoryBreakdown[category]) {
+        categoryBreakdown[category] = {
+          category_name: category,
+          product_count: 0,
+          total_cost_value: 0,
+          total_selling_value: 0,
+          total_current_stock: 0
+        };
+      }
+      categoryBreakdown[category].product_count += 1;
+      categoryBreakdown[category].total_cost_value += parseFloat(item.total_cost_value);
+      categoryBreakdown[category].total_selling_value += parseFloat(item.total_selling_value);
+      categoryBreakdown[category].total_current_stock += parseFloat(item.current_stock);
+    });
+
+    res.json({
+      data: {
+        report: inventoryReport.rows,
+        summary,
+        category_breakdown: Object.values(categoryBreakdown)
+      }
+    });
+
+  } catch (error) {
+    console.error('Inventory value report error:', error);
+    res.status(500).json({ 
+      error: 'Failed to generate inventory value report', 
+      message: error.message 
+    });
+  }
+});
+
+// Get stock movement report
+router.get('/stock-movements', authMiddleware, [
+  query('date_from').optional().isISO8601().withMessage('Date from must be valid ISO date'),
+  query('date_to').optional().isISO8601().withMessage('Date to must be valid ISO date'),
+  query('transaction_type').optional().isIn(['purchase', 'sale', 'adjustment', 'transfer', 'return', 'damaged']).withMessage('Invalid transaction type'),
+  query('group_by').optional().isIn(['day', 'week', 'month']).withMessage('Invalid group by option')
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ 
+        error: 'Validation failed', 
+        details: errors.array() 
+      });
+    }
+
+    const { date_from, date_to, transaction_type, group_by } = req.query;
+    const organizationId = req.user.organization_id;
+
+    let dateFilter = '';
+    const queryParams = [organizationId];
+
+    if (date_from) {
+      dateFilter += ' AND it.created_at >= ?';
+      queryParams.push(new Date(date_from));
+    }
+
+    if (date_to) {
+      dateFilter += ' AND it.created_at <= ?';
+      queryParams.push(new Date(date_to));
+    }
+
+    if (transaction_type) {
+      dateFilter += ' AND it.transaction_type = ?';
+      queryParams.push(transaction_type);
+    }
+
+    // Determine group by clause
+    let groupClause = 'DATE(it.created_at)';
+    if (group_by === 'week') {
+      groupClause = 'DATE_TRUNC(\'week\', it.created_at)';
+    } else if (group_by === 'month') {
+      groupClause = 'DATE_TRUNC(\'month\', it.created_at)';
+    }
+
+    // Build the query
+    let query = `
+      SELECT 
+        ${groupClause} as period,
+        it.transaction_type,
+        COUNT(*) as transaction_count,
+        SUM(it.quantity) as total_quantity,
+        SUM(ABS(it.quantity)) as total_absolute_quantity,
+        SUM(CASE WHEN it.quantity > 0 THEN it.quantity ELSE 0 END) as total_inbound,
+        SUM(CASE WHEN it.quantity < 0 THEN ABS(it.quantity) ELSE 0 END) as total_outbound,
+        COUNT(DISTINCT it.product_id) as unique_products
+      FROM inventory_transactions it
+      WHERE it.organization_id = ? ${dateFilter}
+    `;
+
+    if (transaction_type) {
+      query += ' GROUP BY period, it.transaction_type';
+    } else {
+      query += ' GROUP BY period';
+    }
+
+    query += ' ORDER BY period DESC';
+
+    const [stockMovements] = await db.raw(query, queryParams);
+
+    // Get product breakdown for each period
+    const detailedMovements = await db.raw(`
+      SELECT 
+        ${groupClause} as period,
+        it.transaction_type,
+        p.sku,
+        p.name as product_name,
+        SUM(it.quantity) as net_quantity,
+        SUM(ABS(it.quantity)) as absolute_quantity,
+        COUNT(*) as transaction_count
+      FROM inventory_transactions it
+      JOIN products p ON it.product_id = p.id
+      WHERE it.organization_id = ? ${dateFilter}
+      GROUP BY period, it.transaction_type, p.id, p.sku, p.name
+      ORDER BY period DESC, net_quantity DESC
+    `, queryParams);
+
+    res.json({
+      data: {
+        movements: stockMovements.rows,
+        detailed_breakdown: detailedMovements.rows
+      }
+    });
+
+  } catch (error) {
+    console.error('Stock movements report error:', error);
+    res.status(500).json({ 
+      error: 'Failed to generate stock movements report', 
+      message: error.message 
+    });
+  }
+});
+
+// Get low stock report
+router.get('/low-stock', authMiddleware, [
+  query('severity').optional().isIn(['critical', 'high', 'medium', 'low']).withMessage('Invalid severity level')
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ 
+        error: 'Validation failed', 
+        details: errors.array() 
+      });
+    }
+
+    const { severity } = req.query;
+    const organizationId = req.user.organization_id;
+
+    const lowStockProducts = await db.raw(`
+      SELECT 
+        p.id,
+        p.sku,
+        p.name,
+        p.min_stock_level,
+        p.reorder_point,
+        p.reorder_quantity,
+        COALESCE(stock_summary.current_stock, 0) as current_stock,
+        (COALESCE(stock_summary.current_stock, 0) - p.min_stock_level) as difference_from_min,
+        (p.min_stock_level - COALESCE(stock_summary.current_stock, 0)) as shortage_amount,
+        ROUND(
+          CASE 
+            WHEN COALESCE(stock_summary.current_stock, 0) <= 0 THEN 100
+            WHEN COALESCE(stock_summary.current_stock, 0) <= p.min_stock_level / 2 THEN 75
+            WHEN COALESCE(stock_summary.current_stock, 0) <= p.min_stock_level * 0.75 THEN 50
+            ELSE 25
+          END
+        ) as severity_score,
+        CASE 
+          WHEN COALESCE(stock_summary.current_stock, 0) <= 0 THEN 'critical'
+          WHEN COALESCE(stock_summary.current_stock, 0) <= p.min_stock_level / 2 THEN 'high'
+          WHEN COALESCE(stock_summary.current_stock, 0) <= p.min_stock_level * 0.75 THEN 'medium'
+          ELSE 'low'
+        END as severity_level,
+        c.name as category_name,
+        s.name as supplier_name
+      FROM products p
+      LEFT JOIN categories c ON p.category_id = c.id
+      LEFT JOIN suppliers s ON p.supplier_id = s.id
+      LEFT JOIN (
+        SELECT 
+          product_id, 
+          SUM(CASE WHEN quantity > 0 THEN quantity ELSE 0 END) as current_stock
+        FROM inventory_transactions 
+        WHERE organization_id = ?
+        GROUP BY product_id
+      ) stock_summary ON p.id = stock_summary.product_id
+      WHERE p.organization_id = ? AND p.is_active = true
+        AND COALESCE(stock_summary.current_stock, 0) <= p.min_stock_level
+      ORDER BY severity_score DESC, shortage_amount DESC
+    `, [organizationId, organizationId]);
+
+    // Filter by severity if specified
+    let filteredProducts = lowStockProducts.rows;
+    if (severity) {
+      filteredProducts = lowStockProducts.rows.filter(product => 
+        product.severity_level === severity
+      );
+    }
+
+    // Calculate reorder recommendations
+    const reorderRecommendations = filteredProducts.map(product => {
+      const recommendedOrder = Math.max(
+        product.reorder_quantity,
+        product.min_stock_level - product.current_stock + product.reorder_quantity
+      );
+
+      return {
+        ...product,
+        recommended_order_quantity: Math.ceil(recommendedOrder),
+        estimated_cost: recommendedOrder * (product.cost_price || 0),
+        urgency_level: product.severity_score >= 75 ? 'urgent' : 
+                      product.severity_score >= 50 ? 'normal' : 'low'
+      };
+    });
+
+    // Summary statistics
+    const summary = {
+      total_low_stock: filteredProducts.length,
+      critical_count: filteredProducts.filter(p => p.severity_level === 'critical').length,
+      high_count: filteredProducts.filter(p => p.severity_level === 'high').length,
+      medium_count: filteredProducts.filter(p => p.severity_level === 'medium').length,
+      low_count: filteredProducts.filter(p => p.severity_level === 'low').length,
+      total_shortage_value: filteredProducts.reduce((sum, p) => sum + (p.shortage_amount * (p.cost_price || 0)), 0)
+    };
+
+    res.json({
+      data: {
+        low_stock_products: reorderRecommendations,
+        summary
+      }
+    });
+
+  } catch (error) {
+    console.error('Low stock report error:', error);
+    res.status(500).json({ 
+      error: 'Failed to generate low stock report', 
+      message: error.message 
+    });
+  }
+});
+
+// Get purchase order report
+router.get('/purchase-orders', authMiddleware, [
+  query('date_from').optional().isISO8601().withMessage('Date from must be valid ISO date'),
+  query('date_to').optional().isISO8601().withMessage('Date to must be valid ISO date'),
+  query('status').optional().isIn(['draft', 'sent', 'confirmed', 'partially_received', 'received', 'cancelled']).withMessage('Invalid status')
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ 
+        error: 'Validation failed', 
+        details: errors.array() 
+      });
+    }
+
+    const { date_from, date_to, status } = req.query;
+    const organizationId = req.user.organization_id;
+
+    let query = db('purchase_orders as po')
+      .select(
+        'po.id',
+        'po.order_number',
+        'po.order_date',
+        'po.status',
+        'po.total_amount',
+        'po.expected_delivery_date',
+        's.name as supplier_name',
+        's.contact_person',
+        'COUNT(DISTINCT poi.id) as item_count'
+      )
+      .join('suppliers as s', 'po.supplier_id', '=', 's.id')
+      .leftJoin('purchase_order_items as poi', 'po.id', '=', 'poi.purchase_order_id')
+      .where('po.organization_id', organizationId);
+
+    if (date_from) {
+      query = query.where('po.order_date', '>=', new Date(date_from));
+    }
+
+    if (date_to) {
+      query = query.where('po.order_date', '<=', new Date(date_to));
+    }
+
+    if (status) {
+      query = query.where('po.status', status);
+    }
+
+    const purchaseOrders = await query
+      .groupBy('po.id', 's.id')
+      .orderBy('po.created_at', 'desc');
+
+    // Calculate summary statistics
+    const summary = {
+      total_orders: purchaseOrders.length,
+      total_value: purchaseOrders.reduce((sum, order) => sum + parseFloat(order.total_amount), 0),
+      status_breakdown: purchaseOrders.reduce((acc, order) => {
+        acc[order.status] = (acc[order.status] || 0) + 1;
+        return acc;
+      }, {}),
+      average_order_value: purchaseOrders.length > 0 
+        ? purchaseOrders.reduce((sum, order) => sum + parseFloat(order.total_amount), 0) / purchaseOrders.length 
+        : 0
+    };
+
+    res.json({
+      data: {
+        purchase_orders: purchaseOrders,
+        summary
+      }
+    });
+
+  } catch (error) {
+    console.error('Purchase order report error:', error);
+    res.status(500).json({ 
+      error: 'Failed to generate purchase order report', 
+      message: error.message 
+    });
+  }
+});
+
+module.exports = router;

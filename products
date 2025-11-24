@@ -1,0 +1,664 @@
+const express = require('express');
+const { body, query, validationResult } = require('express-validator');
+const db = require('../database');
+const { authMiddleware, authorize } = require('../authMiddleware');
+
+const router = express.Router();
+
+// Get all products with optional filters
+router.get('/', authMiddleware, [
+  query('page').optional().isInt({ min: 1 }).withMessage('Page must be a positive integer'),
+  query('limit').optional().isInt({ min: 1, max: 100 }).withMessage('Limit must be between 1 and 100'),
+  query('category_id').optional().isUUID().withMessage('Category ID must be a valid UUID'),
+  query('search').optional().isLength({ min: 1 }).withMessage('Search term cannot be empty'),
+  query('low_stock').optional().isBoolean().withMessage('Low stock filter must be boolean')
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ 
+        error: 'Validation failed', 
+        details: errors.array() 
+      });
+    }
+
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 20;
+    const offset = (page - 1) * limit;
+    const { category_id, search, low_stock } = req.query;
+
+    // Build query with filters
+    let query = db('products as p')
+      .select(
+        'p.id',
+        'p.sku',
+        'p.barcode',
+        'p.name',
+        'p.description',
+        'p.unit_of_measure',
+        'p.cost_price',
+        'p.selling_price',
+        'p.min_stock_level',
+        'p.max_stock_level',
+        'p.reorder_point',
+        'p.reorder_quantity',
+        'p.location',
+        'p.track_inventory',
+        'p.is_active',
+        'p.created_at',
+        'p.updated_at',
+        'c.name as category_name',
+        db.raw('COALESCE(stock_summary.current_stock, 0) as current_stock')
+      )
+      .leftJoin('categories as c', 'p.category_id', '=', 'c.id')
+      .leftJoin(
+        db.raw(`
+          (SELECT 
+            product_id, 
+            SUM(CASE WHEN quantity > 0 THEN quantity ELSE 0 END) as current_stock
+          FROM inventory_transactions 
+          WHERE organization_id = ?
+          GROUP BY product_id) as stock_summary
+        `),
+        'p.id', '=', 'stock_summary.product_id'
+      )
+      .where('p.organization_id', req.user.organization_id)
+      .where('p.is_active', true);
+
+    // Apply filters
+    if (category_id) {
+      query = query.where('p.category_id', category_id);
+    }
+
+    if (search) {
+      query = query.where(function() {
+        this.where('p.name', 'ilike', `%${search}%`)
+          .orWhere('p.sku', 'ilike', `%${search}%`)
+          .orWhere('p.barcode', 'ilike', `%${search}%`);
+      });
+    }
+
+    if (low_stock === 'true') {
+      query = query.whereRaw('COALESCE(stock_summary.current_stock, 0) <= p.min_stock_level');
+    }
+
+    // Get total count for pagination
+    const countQuery = query.clone().count('p.id as total');
+    const [{ total }] = await countQuery;
+    const totalProducts = parseInt(total);
+
+    // Apply pagination and ordering
+    query = query
+      .orderBy('p.name', 'asc')
+      .limit(limit)
+      .offset(offset);
+
+    const products = await query;
+
+    // Calculate pagination metadata
+    const totalPages = Math.ceil(totalProducts / limit);
+    const hasNextPage = page < totalPages;
+    const hasPrevPage = page > 1;
+
+    res.json({
+      data: {
+        products,
+        pagination: {
+          current_page: page,
+          per_page: limit,
+          total: totalProducts,
+          total_pages: totalPages,
+          has_next_page: hasNextPage,
+          has_prev_page: hasPrevPage
+        }
+      }
+    });
+
+  } catch (error) {
+    console.error('Get products error:', error);
+    res.status(500).json({ 
+      error: 'Failed to fetch products', 
+      message: error.message 
+    });
+  }
+});
+
+// Get single product by ID
+router.get('/:id', authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const product = await db('products as p')
+      .select(
+        'p.id',
+        'p.sku',
+        'p.barcode',
+        'p.name',
+        'p.description',
+        'p.unit_of_measure',
+        'p.cost_price',
+        'p.selling_price',
+        'p.min_stock_level',
+        'p.max_stock_level',
+        'p.reorder_point',
+        'p.reorder_quantity',
+        'p.location',
+        'p.track_inventory',
+        'p.is_active',
+        'p.custom_fields',
+        'p.metadata',
+        'p.created_at',
+        'p.updated_at',
+        'c.id as category_id',
+        'c.name as category_name',
+        db.raw('COALESCE(stock_summary.current_stock, 0) as current_stock'),
+        db.raw('COALESCE(stock_summary.total_transactions, 0) as total_transactions')
+      )
+      .leftJoin('categories as c', 'p.category_id', '=', 'c.id')
+      .leftJoin(
+        db.raw(`
+          (SELECT 
+            product_id, 
+            SUM(CASE WHEN quantity > 0 THEN quantity ELSE 0 END) as current_stock,
+            COUNT(*) as total_transactions
+          FROM inventory_transactions 
+          WHERE organization_id = ?
+          GROUP BY product_id) as stock_summary
+        `),
+        'p.id', '=', 'stock_summary.product_id'
+      )
+      .where('p.id', id)
+      .where('p.organization_id', req.user.organization_id)
+      .first();
+
+    if (!product) {
+      return res.status(404).json({ 
+        error: 'Product not found' 
+      });
+    }
+
+    // Get recent transactions for this product
+    const recentTransactions = await db('inventory_transactions')
+      .select(
+        'quantity',
+        'transaction_type',
+        'reference_number',
+        'notes',
+        'created_at',
+        'users.first_name',
+        'users.last_name'
+      )
+      .leftJoin('users', 'inventory_transactions.user_id', '=', 'users.id')
+      .where('product_id', id)
+      .where('organization_id', req.user.organization_id)
+      .orderBy('created_at', 'desc')
+      .limit(10);
+
+    res.json({
+      data: {
+        product: {
+          ...product,
+          recent_transactions: recentTransactions
+        }
+      }
+    });
+
+  } catch (error) {
+    console.error('Get product error:', error);
+    res.status(500).json({ 
+      error: 'Failed to fetch product', 
+      message: error.message 
+    });
+  }
+});
+
+// Create new product
+router.post('/', authMiddleware, [
+  body('sku').notEmpty().withMessage('SKU is required'),
+  body('name').notEmpty().withMessage('Product name is required'),
+  body('cost_price').optional().isFloat({ min: 0 }).withMessage('Cost price must be a positive number'),
+  body('selling_price').optional().isFloat({ min: 0 }).withMessage('Selling price must be a positive number'),
+  body('min_stock_level').optional().isFloat({ min: 0 }).withMessage('Minimum stock level must be positive'),
+  body('category_id').optional().isUUID().withMessage('Category ID must be a valid UUID')
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ 
+        error: 'Validation failed', 
+        details: errors.array() 
+      });
+    }
+
+    const {
+      sku,
+      barcode,
+      name,
+      description,
+      category_id,
+      unit_of_measure,
+      cost_price,
+      selling_price,
+      min_stock_level,
+      max_stock_level,
+      reorder_point,
+      reorder_quantity,
+      location,
+      track_inventory,
+      custom_fields,
+      metadata
+    } = req.body;
+
+    // Check if SKU already exists in the organization
+    const existingProduct = await db('products')
+      .where('organization_id', req.user.organization_id)
+      .where('sku', sku)
+      .first();
+
+    if (existingProduct) {
+      return res.status(400).json({ 
+        error: 'A product with this SKU already exists' 
+      });
+    }
+
+    // Validate category exists (if provided)
+    if (category_id) {
+      const category = await db('categories')
+        .where('id', category_id)
+        .where('organization_id', req.user.organization_id)
+        .first();
+
+      if (!category) {
+        return res.status(400).json({ 
+          error: 'Invalid category selected' 
+        });
+      }
+    }
+
+    const productData = {
+      organization_id: req.user.organization_id,
+      sku,
+      barcode,
+      name,
+      description,
+      category_id,
+      unit_of_measure: unit_of_measure || 'pieces',
+      cost_price,
+      selling_price,
+      min_stock_level: min_stock_level || 0,
+      max_stock_level,
+      reorder_point: reorder_point || 10,
+      reorder_quantity: reorder_quantity || 50,
+      location,
+      track_inventory: track_inventory !== false,
+      custom_fields: custom_fields || {},
+      metadata: metadata || {},
+      is_active: true
+    };
+
+    const [product] = await db('products')
+      .insert(productData)
+      .returning('*');
+
+    res.status(201).json({
+      message: 'Product created successfully',
+      data: { product }
+    });
+
+  } catch (error) {
+    console.error('Create product error:', error);
+    res.status(500).json({ 
+      error: 'Failed to create product', 
+      message: error.message 
+    });
+  }
+});
+
+// Update product
+router.put('/:id', authMiddleware, [
+  body('name').optional().notEmpty().withMessage('Product name cannot be empty'),
+  body('cost_price').optional().isFloat({ min: 0 }).withMessage('Cost price must be positive'),
+  body('selling_price').optional().isFloat({ min: 0 }).withMessage('Selling price must be positive'),
+  body('category_id').optional().isUUID().withMessage('Category ID must be valid UUID')
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ 
+        error: 'Validation failed', 
+        details: errors.array() 
+      });
+    }
+
+    const { id } = req.params;
+    const {
+      sku,
+      barcode,
+      name,
+      description,
+      category_id,
+      unit_of_measure,
+      cost_price,
+      selling_price,
+      min_stock_level,
+      max_stock_level,
+      reorder_point,
+      reorder_quantity,
+      location,
+      track_inventory,
+      custom_fields,
+      metadata,
+      is_active
+    } = req.body;
+
+    // Check if product exists and belongs to user's organization
+    const existingProduct = await db('products')
+      .where('id', id)
+      .where('organization_id', req.user.organization_id)
+      .first();
+
+    if (!existingProduct) {
+      return res.status(404).json({ 
+        error: 'Product not found' 
+      });
+    }
+
+    // Check if SKU is unique (if changed)
+    if (sku && sku !== existingProduct.sku) {
+      const skuExists = await db('products')
+        .where('sku', sku)
+        .where('organization_id', req.user.organization_id)
+        .where('id', '!=', id)
+        .first();
+
+      if (skuExists) {
+        return res.status(400).json({ 
+          error: 'A product with this SKU already exists' 
+        });
+      }
+    }
+
+    // Validate category exists (if provided and different)
+    if (category_id && category_id !== existingProduct.category_id) {
+      const category = await db('categories')
+        .where('id', category_id)
+        .where('organization_id', req.user.organization_id)
+        .first();
+
+      if (!category) {
+        return res.status(400).json({ 
+          error: 'Invalid category selected' 
+        });
+      }
+    }
+
+    const updateData = {};
+    if (sku !== undefined) updateData.sku = sku;
+    if (barcode !== undefined) updateData.barcode = barcode;
+    if (name !== undefined) updateData.name = name;
+    if (description !== undefined) updateData.description = description;
+    if (category_id !== undefined) updateData.category_id = category_id;
+    if (unit_of_measure !== undefined) updateData.unit_of_measure = unit_of_measure;
+    if (cost_price !== undefined) updateData.cost_price = cost_price;
+    if (selling_price !== undefined) updateData.selling_price = selling_price;
+    if (min_stock_level !== undefined) updateData.min_stock_level = min_stock_level;
+    if (max_stock_level !== undefined) updateData.max_stock_level = max_stock_level;
+    if (reorder_point !== undefined) updateData.reorder_point = reorder_point;
+    if (reorder_quantity !== undefined) updateData.reorder_quantity = reorder_quantity;
+    if (location !== undefined) updateData.location = location;
+    if (track_inventory !== undefined) updateData.track_inventory = track_inventory;
+    if (custom_fields !== undefined) updateData.custom_fields = custom_fields;
+    if (metadata !== undefined) updateData.metadata = metadata;
+    if (is_active !== undefined) updateData.is_active = is_active;
+
+    updateData.updated_at = new Date();
+
+    await db('products')
+      .where('id', id)
+      .update(updateData);
+
+    const updatedProduct = await db('products')
+      .where('id', id)
+      .first();
+
+    res.json({
+      message: 'Product updated successfully',
+      data: { product: updatedProduct }
+    });
+
+  } catch (error) {
+    console.error('Update product error:', error);
+    res.status(500).json({ 
+      error: 'Failed to update product', 
+      message: error.message 
+    });
+  }
+});
+
+// Delete product (soft delete)
+router.delete('/:id', authMiddleware, authorize('admin', 'manager'), async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const product = await db('products')
+      .where('id', id)
+      .where('organization_id', req.user.organization_id)
+      .first();
+
+    if (!product) {
+      return res.status(404).json({ 
+        error: 'Product not found' 
+      });
+    }
+
+    // Check if product has transactions
+    const transactionCount = await db('inventory_transactions')
+      .where('product_id', id)
+      .count('* as count')
+      .first();
+
+    if (parseInt(transactionCount.count) > 0) {
+      // Soft delete - just mark as inactive
+      await db('products')
+        .where('id', id)
+        .update({ 
+          is_active: false,
+          updated_at: new Date()
+        });
+
+      res.json({
+        message: 'Product deactivated (has existing transactions)',
+        data: { deactivated: true }
+      });
+    } else {
+      // Hard delete if no transactions
+      await db('products')
+        .where('id', id)
+        .del();
+
+      res.json({
+        message: 'Product deleted successfully',
+        data: { deleted: true }
+      });
+    }
+
+  } catch (error) {
+    console.error('Delete product error:', error);
+    res.status(500).json({ 
+      error: 'Failed to delete product', 
+      message: error.message 
+    });
+  }
+});
+
+// Bulk import products
+router.post('/bulk-import', authMiddleware, authorize('admin', 'manager'), [
+  body('products').isArray({ min: 1 }).withMessage('Products array is required'),
+  body('products.*.sku').notEmpty().withMessage('SKU is required for each product'),
+  body('products.*.name').notEmpty().withMessage('Product name is required for each product')
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ 
+        error: 'Validation failed', 
+        details: errors.array() 
+      });
+    }
+
+    const { products } = req.body;
+    const results = {
+      success: [],
+      errors: []
+    };
+
+    for (let i = 0; i < products.length; i++) {
+      const product = products[i];
+      try {
+        // Check if SKU already exists
+        const existingProduct = await db('products')
+          .where('organization_id', req.user.organization_id)
+          .where('sku', product.sku)
+          .first();
+
+        if (existingProduct) {
+          results.errors.push({
+            row: i + 1,
+            sku: product.sku,
+            error: 'SKU already exists'
+          });
+          continue;
+        }
+
+        const productData = {
+          organization_id: req.user.organization_id,
+          sku: product.sku,
+          barcode: product.barcode,
+          name: product.name,
+          description: product.description,
+          unit_of_measure: product.unit_of_measure || 'pieces',
+          cost_price: product.cost_price,
+          selling_price: product.selling_price,
+          min_stock_level: product.min_stock_level || 0,
+          max_stock_level: product.max_stock_level,
+          reorder_point: product.reorder_point || 10,
+          reorder_quantity: product.reorder_quantity || 50,
+          location: product.location,
+          track_inventory: product.track_inventory !== false,
+          is_active: true
+        };
+
+        const [createdProduct] = await db('products')
+          .insert(productData)
+          .returning('*');
+
+        results.success.push({
+          row: i + 1,
+          sku: product.sku,
+          id: createdProduct.id,
+          name: createdProduct.name
+        });
+
+      } catch (error) {
+        results.errors.push({
+          row: i + 1,
+          sku: product.sku,
+          error: error.message
+        });
+      }
+    }
+
+    res.json({
+      message: `Bulk import completed. ${results.success.length} products imported, ${results.errors.length} errors.`,
+      data: results
+    });
+
+  } catch (error) {
+    console.error('Bulk import error:', error);
+    res.status(500).json({ 
+      error: 'Bulk import failed', 
+      message: error.message 
+    });
+  }
+});
+
+// Export products to CSV
+router.get('/export/csv', authMiddleware, async (req, res) => {
+  try {
+    const products = await db('products as p')
+      .select(
+        'p.sku',
+        'p.barcode',
+        'p.name',
+        'p.description',
+        'p.unit_of_measure',
+        'p.cost_price',
+        'p.selling_price',
+        'p.min_stock_level',
+        'p.max_stock_level',
+        'p.reorder_point',
+        'p.reorder_quantity',
+        'p.location',
+        'c.name as category_name',
+        db.raw('COALESCE(stock_summary.current_stock, 0) as current_stock'),
+        'p.is_active',
+        'p.created_at',
+        'p.updated_at'
+      )
+      .leftJoin('categories as c', 'p.category_id', '=', 'c.id')
+      .leftJoin(
+        db.raw(`
+          (SELECT 
+            product_id, 
+            SUM(CASE WHEN quantity > 0 THEN quantity ELSE 0 END) as current_stock
+          FROM inventory_transactions 
+          WHERE organization_id = ?
+          GROUP BY product_id) as stock_summary
+        `),
+        'p.id', '=', 'stock_summary.product_id'
+      )
+      .where('p.organization_id', req.user.organization_id)
+      .where('p.is_active', true)
+      .orderBy('p.name', 'asc');
+
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', 'attachment; filename=products_export.csv');
+
+    // Create CSV header
+    const csvHeader = 'SKU,Barcode,Name,Description,Unit of Measure,Cost Price,Selling Price,Min Stock Level,Max Stock Level,Reorder Point,Reorder Quantity,Location,Category,Current Stock,Active,Created At,Updated At\n';
+
+    // Create CSV rows
+    const csvRows = products.map(product => {
+      return [
+        product.sku || '',
+        product.barcode || '',
+        `"${(product.name || '').replace(/"/g, '""')}"`,
+        `"${(product.description || '').replace(/"/g, '""')}"`,
+        product.unit_of_measure || '',
+        product.cost_price || '',
+        product.selling_price || '',
+        product.min_stock_level || '',
+        product.max_stock_level || '',
+        product.reorder_point || '',
+        product.reorder_quantity || '',
+        product.location || '',
+        product.category_name || '',
+        product.current_stock || '0',
+        product.is_active ? 'Yes' : 'No',
+        product.created_at || '',
+        product.updated_at || ''
+      ].join(',');
+    }).join('\n');
+
+    res.send(csvHeader + csvRows);
+
+  } catch (error) {
+    console.error('Export CSV error:', error);
+    res.status(500).json({ 
+      error: 'Failed to export products', 
+      message: error.message 
+    });
+  }
+});
+
+module.exports = router;

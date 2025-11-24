@@ -1,0 +1,412 @@
+const express = require('express');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const { body, validationResult } = require('express-validator');
+const db = require('../database');
+const { authMiddleware } = require('../authMiddleware');
+
+const router = express.Router();
+
+// Register new organization and admin user
+router.post('/register', [
+  body('organization_name').notEmpty().withMessage('Organization name is required'),
+  body('organization_email').isEmail().withMessage('Valid organization email is required'),
+  body('first_name').notEmpty().withMessage('First name is required'),
+  body('last_name').notEmpty().withMessage('Last name is required'),
+  body('email').isEmail().withMessage('Valid email is required'),
+  body('password').isLength({ min: 6 }).withMessage('Password must be at least 6 characters')
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ 
+        error: 'Validation failed', 
+        details: errors.array() 
+      });
+    }
+
+    const { 
+      organization_name, 
+      organization_email, 
+      organization_phone, 
+      organization_address,
+      first_name, 
+      last_name, 
+      email, 
+      password 
+    } = req.body;
+
+    // Check if user already exists
+    const existingUser = await db('users').where('email', email).first();
+    if (existingUser) {
+      return res.status(400).json({ 
+        error: 'User with this email already exists' 
+      });
+    }
+
+    // Generate organization slug
+    const slug = organization_name
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/(^-|-$)/g, '');
+
+    // Check if slug exists
+    const existingOrg = await db('organizations').where('slug', slug).first();
+    if (existingOrg) {
+      return res.status(400).json({ 
+        error: 'Organization name already exists. Please choose a different name.' 
+      });
+    }
+
+    // Hash password
+    const saltRounds = 12;
+    const password_hash = await bcrypt.hash(password, saltRounds);
+
+    // Create organization and admin user in a transaction
+    const result = await db.transaction(async trx => {
+      // Create organization
+      const [organization] = await trx('organizations')
+        .insert({
+          name: organization_name,
+          slug,
+          email: organization_email,
+          phone: organization_phone,
+          address: organization_address,
+          subscription_tier: 'free',
+          subscription_status: 'active',
+          trial_ends_at: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000) // 14 days trial
+        })
+        .returning(['id', 'name', 'slug']);
+
+      // Create admin user
+      const [user] = await trx('users')
+        .insert({
+          organization_id: organization[0].id,
+          first_name,
+          last_name,
+          email,
+          password_hash,
+          role: 'admin',
+          is_active: true
+        })
+        .returning(['id', 'email', 'first_name', 'last_name', 'role']);
+
+      return { organization: organization[0], user: user[0] };
+    });
+
+    // Generate JWT token
+    const token = jwt.sign(
+      { 
+        userId: result.user.id, 
+        organizationId: result.organization.id,
+        role: result.user.role 
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: process.env.JWT_EXPIRES_IN || '24h' }
+    );
+
+    res.status(201).json({
+      message: 'Registration successful',
+      data: {
+        token,
+        user: {
+          id: result.user.id,
+          email: result.user.email,
+          first_name: result.user.first_name,
+          last_name: result.user.last_name,
+          role: result.user.role
+        },
+        organization: {
+          id: result.organization.id,
+          name: result.organization.name,
+          slug: result.organization.slug,
+          subscription_tier: 'free'
+        }
+      }
+    });
+
+  } catch (error) {
+    console.error('Registration error:', error);
+    res.status(500).json({ 
+      error: 'Registration failed', 
+      message: error.message 
+    });
+  }
+});
+
+// Login
+router.post('/login', [
+  body('email').isEmail().withMessage('Valid email is required'),
+  body('password').notEmpty().withMessage('Password is required')
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ 
+        error: 'Validation failed', 
+        details: errors.array() 
+      });
+    }
+
+    const { email, password } = req.body;
+
+    // Find user with organization details
+    const user = await db('users as u')
+      .select(
+        'u.id',
+        'u.email',
+        'u.first_name',
+        'u.last_name',
+        'u.password_hash',
+        'u.role',
+        'u.organization_id',
+        'u.is_active',
+        'o.name as organization_name',
+        'o.slug as organization_slug',
+        'o.subscription_tier',
+        'o.subscription_status'
+      )
+      .join('organizations as o', 'u.organization_id', '=', 'o.id')
+      .where('u.email', email)
+      .first();
+
+    if (!user) {
+      return res.status(401).json({ 
+        error: 'Invalid credentials' 
+      });
+    }
+
+    if (!user.is_active) {
+      return res.status(401).json({ 
+        error: 'Account is deactivated. Please contact support.' 
+      });
+    }
+
+    // Check password
+    const isPasswordValid = await bcrypt.compare(password, user.password_hash);
+    if (!isPasswordValid) {
+      return res.status(401).json({ 
+        error: 'Invalid credentials' 
+      });
+    }
+
+    // Update last login
+    await db('users')
+      .where('id', user.id)
+      .update({ last_login_at: new Date() });
+
+    // Generate JWT token
+    const token = jwt.sign(
+      { 
+        userId: user.id, 
+        organizationId: user.organization_id,
+        role: user.role 
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: process.env.JWT_EXPIRES_IN || '24h' }
+    );
+
+    res.json({
+      message: 'Login successful',
+      data: {
+        token,
+        user: {
+          id: user.id,
+          email: user.email,
+          first_name: user.first_name,
+          last_name: user.last_name,
+          role: user.role,
+          organization: {
+            id: user.organization_id,
+            name: user.organization_name,
+            slug: user.organization_slug,
+            subscription_tier: user.subscription_tier,
+            subscription_status: user.subscription_status
+          }
+        }
+      }
+    });
+
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({ 
+      error: 'Login failed', 
+      message: error.message 
+    });
+  }
+});
+
+// Get current user profile
+router.get('/profile', authMiddleware, async (req, res) => {
+  try {
+    const user = await db('users as u')
+      .select(
+        'u.id',
+        'u.email',
+        'u.first_name',
+        'u.last_name',
+        'u.role',
+        'u.organization_id',
+        'u.created_at',
+        'u.last_login_at',
+        'o.name as organization_name',
+        'o.slug as organization_slug',
+        'o.subscription_tier',
+        'o.subscription_status',
+        'o.trial_ends_at'
+      )
+      .join('organizations as o', 'u.organization_id', '=', 'o.id')
+      .where('u.id', req.user.id)
+      .first();
+
+    if (!user) {
+      return res.status(404).json({ 
+        error: 'User not found' 
+      });
+    }
+
+    res.json({
+      data: {
+        user: {
+          id: user.id,
+          email: user.email,
+          first_name: user.first_name,
+          last_name: user.last_name,
+          role: user.role,
+          created_at: user.created_at,
+          last_login_at: user.last_login_at,
+          organization: {
+            id: user.organization_id,
+            name: user.organization_name,
+            slug: user.organization_slug,
+            subscription_tier: user.subscription_tier,
+            subscription_status: user.subscription_status,
+            trial_ends_at: user.trial_ends_at
+          }
+        }
+      }
+    });
+
+  } catch (error) {
+    console.error('Profile fetch error:', error);
+    res.status(500).json({ 
+      error: 'Failed to fetch profile', 
+      message: error.message 
+    });
+  }
+});
+
+// Update user profile
+router.put('/profile', authMiddleware, [
+  body('first_name').optional().notEmpty().withMessage('First name cannot be empty'),
+  body('last_name').optional().notEmpty().withMessage('Last name cannot be empty'),
+  body('email').optional().isEmail().withMessage('Valid email is required')
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ 
+        error: 'Validation failed', 
+        details: errors.array() 
+      });
+    }
+
+    const { first_name, last_name, email } = req.body;
+    const updateData = {};
+
+    if (first_name) updateData.first_name = first_name;
+    if (last_name) updateData.last_name = last_name;
+    
+    if (email) {
+      // Check if email is already taken by another user
+      const existingUser = await db('users')
+        .where('email', email)
+        .where('id', '!=', req.user.id)
+        .first();
+      
+      if (existingUser) {
+        return res.status(400).json({ 
+          error: 'Email is already taken by another user' 
+        });
+      }
+      
+      updateData.email = email;
+    }
+
+    await db('users')
+      .where('id', req.user.id)
+      .update(updateData);
+
+    res.json({
+      message: 'Profile updated successfully',
+      data: { user: { id: req.user.id, ...updateData } }
+    });
+
+  } catch (error) {
+    console.error('Profile update error:', error);
+    res.status(500).json({ 
+      error: 'Failed to update profile', 
+      message: error.message 
+    });
+  }
+});
+
+// Change password
+router.put('/change-password', authMiddleware, [
+  body('current_password').notEmpty().withMessage('Current password is required'),
+  body('new_password').isLength({ min: 6 }).withMessage('New password must be at least 6 characters')
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ 
+        error: 'Validation failed', 
+        details: errors.array() 
+      });
+    }
+
+    const { current_password, new_password } = req.body;
+
+    // Get current user with password
+    const user = await db('users')
+      .select('password_hash')
+      .where('id', req.user.id)
+      .first();
+
+    if (!user) {
+      return res.status(404).json({ 
+        error: 'User not found' 
+      });
+    }
+
+    // Verify current password
+    const isCurrentPasswordValid = await bcrypt.compare(current_password, user.password_hash);
+    if (!isCurrentPasswordValid) {
+      return res.status(400).json({ 
+        error: 'Current password is incorrect' 
+      });
+    }
+
+    // Hash new password
+    const saltRounds = 12;
+    const new_password_hash = await bcrypt.hash(new_password, saltRounds);
+
+    // Update password
+    await db('users')
+      .where('id', req.user.id)
+      .update({ password_hash: new_password_hash });
+
+    res.json({
+      message: 'Password changed successfully'
+    });
+
+  } catch (error) {
+    console.error('Password change error:', error);
+    res.status(500).json({ 
+      error: 'Failed to change password', 
+      message: error.message 
+    });
+  }
+});
+
+module.exports = router;

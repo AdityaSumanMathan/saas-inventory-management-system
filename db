@@ -1,0 +1,119 @@
+/**
+ * @param { import("knex").Knex } knex
+ * @returns { Promise<void> }
+ */
+exports.up = function(knex) {
+  return knex.schema
+    // Organizations table (multi-tenant SaaS structure)
+    .createTable('organizations', function(table) {
+      table.uuid('id').primary().defaultTo(knex.raw('gen_random_uuid()'));
+      table.string('name').notNullable();
+      table.string('slug').unique().notNullable(); // URL-friendly identifier
+      table.string('email').notNullable();
+      table.string('phone');
+      table.text('address');
+      table.string('subscription_tier').defaultTo('free'); // free, basic, professional, enterprise
+      table.string('subscription_status').defaultTo('active');
+      table.timestamp('trial_ends_at');
+      table.boolean('is_active').defaultTo(true);
+      table.json('settings'); // Flexible JSON settings for customization
+      table.timestamps(true, true);
+    })
+
+    // Users table
+    .createTable('users', function(table) {
+      table.uuid('id').primary().defaultTo(knex.raw('gen_random_uuid()'));
+      table.uuid('organization_id').references('id').inTable('organizations').onDelete('CASCADE');
+      table.string('first_name').notNullable();
+      table.string('last_name').notNullable();
+      table.string('email').notNullable().unique();
+      table.string('password_hash').notNullable();
+      table.enum('role', ['admin', 'manager', 'staff', 'viewer']).notNullable().defaultTo('staff');
+      table.boolean('is_active').defaultTo(true);
+      table.timestamp('last_login_at');
+      table.string('reset_password_token');
+      table.timestamp('reset_password_expires');
+      table.timestamps(true, true);
+    })
+
+    // Categories table
+    .createTable('categories', function(table) {
+      table.uuid('id').primary().defaultTo(knex.raw('gen_random_uuid()'));
+      table.uuid('organization_id').references('id').inTable('organizations').onDelete('CASCADE');
+      table.string('name').notNullable();
+      table.text('description');
+      table.uuid('parent_id').references('id').inTable('categories').onDelete('CASCADE'); // For nested categories
+      table.integer('sort_order').defaultTo(0);
+      table.timestamps(true, true);
+    })
+
+    // Suppliers table
+    .createTable('suppliers', function(table) {
+      table.uuid('id').primary().defaultTo(knex.raw('gen_random_uuid()'));
+      table.uuid('organization_id').references('id').inTable('organizations').onDelete('CASCADE');
+      table.string('name').notNullable();
+      table.string('contact_person');
+      table.string('email');
+      table.string('phone');
+      table.text('address');
+      table.string('website');
+      table.decimal('payment_terms_days', 3, 0).defaultTo(30); // Payment terms in days
+      table.boolean('is_active').defaultTo(true);
+      table.json('metadata'); // Flexible metadata for additional supplier info
+      table.timestamps(true, true);
+    })
+
+    // Products table
+    .createTable('products', function(table) {
+      table.uuid('id').primary().defaultTo(knex.raw('gen_random_uuid()'));
+      table.uuid('organization_id').references('id').inTable('organizations').onDelete('CASCADE');
+      table.uuid('category_id').references('id').inTable('categories').onDelete('SET NULL');
+      table.string('sku').notNullable(); // Stock Keeping Unit
+      table.string('barcode');
+      table.string('name').notNullable();
+      table.text('description');
+      table.string('unit_of_measure').defaultTo('pieces'); // pieces, kg, liters, etc.
+      table.decimal('cost_price', 10, 2);
+      table.decimal('selling_price', 10, 2);
+      table.decimal('min_stock_level', 10, 2).defaultTo(0); // Minimum stock threshold
+      table.decimal('max_stock_level', 10, 2); // Maximum stock level
+      table.integer('reorder_point').defaultTo(10); // When to reorder
+      table.integer('reorder_quantity').defaultTo(50); // Default reorder quantity
+      table.string('location'); // Storage location
+      table.boolean('track_inventory').defaultTo(true);
+      table.boolean('is_active').defaultTo(true);
+      table.json('custom_fields'); // Flexible custom fields
+      table.json('metadata'); // Additional product metadata
+      table.timestamps(true, true);
+      table.unique(['organization_id', 'sku']);
+    })
+
+    // Inventory transactions table
+    .createTable('inventory_transactions', function(table) {
+      table.uuid('id').primary().defaultTo(knex.raw('gen_random_uuid()'));
+      table.uuid('organization_id').references('id').inTable('organizations').onDelete('CASCADE');
+      table.uuid('product_id').references('id').inTable('products').onDelete('CASCADE');
+      table.uuid('user_id').references('id').inTable('users').onDelete('SET NULL'); // Who made the transaction
+      table.decimal('quantity', 12, 3).notNullable(); // Positive for stock in, negative for stock out
+      table.decimal('previous_stock', 12, 3).notNullable();
+      table.decimal('new_stock', 12, 3).notNullable();
+      table.enum('transaction_type', ['purchase', 'sale', 'adjustment', 'transfer', 'return', 'damaged']).notNullable();
+      table.string('reference_number'); // PO number, Invoice number, etc.
+      table.text('notes');
+      table.timestamps(true, true);
+    });
+};
+
+/**
+ * @param { import("knex").Knex } knex
+ * @returns { Promise<void> }
+ */
+exports.down = function(knex) {
+  return knex.schema
+    .dropTableIfExists('inventory_transactions')
+    .dropTableIfExists('products')
+    .dropTableIfExists('suppliers')
+    .dropTableIfExists('categories')
+    .dropTableIfExists('users')
+    .dropTableIfExists('organizations');
+};

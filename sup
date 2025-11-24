@@ -1,0 +1,504 @@
+const express = require('express');
+const { body, query, validationResult } = require('express-validator');
+const db = require('../database');
+const { authMiddleware, authorize } = require('../authMiddleware');
+
+const router = express.Router();
+
+// Get all suppliers
+router.get('/', authMiddleware, [
+  query('page').optional().isInt({ min: 1 }).withMessage('Page must be positive integer'),
+  query('limit').optional().isInt({ min: 1, max: 100 }).withMessage('Limit must be 1-100'),
+  query('search').optional().isLength({ min: 1 }).withMessage('Search term cannot be empty'),
+  query('is_active').optional().isBoolean().withMessage('Active filter must be boolean')
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ 
+        error: 'Validation failed', 
+        details: errors.array() 
+      });
+    }
+
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 20;
+    const offset = (page - 1) * limit;
+    const { search, is_active } = req.query;
+
+    let query = db('suppliers')
+      .where('organization_id', req.user.organization_id);
+
+    // Apply filters
+    if (search) {
+      query = query.where(function() {
+        this.where('name', 'ilike', `%${search}%`)
+          .orWhere('contact_person', 'ilike', `%${search}%`)
+          .orWhere('email', 'ilike', `%${search}%`);
+      });
+    }
+
+    if (is_active !== undefined) {
+      query = query.where('is_active', is_active === 'true');
+    }
+
+    // Get total count
+    const countQuery = query.clone().count('* as total');
+    const [{ total }] = await countQuery;
+    const totalSuppliers = parseInt(total);
+
+    // Apply pagination and ordering
+    query = query
+      .orderBy('name', 'asc')
+      .limit(limit)
+      .offset(offset);
+
+    const suppliers = await query;
+
+    // Get summary statistics for each supplier
+    const suppliersWithStats = await Promise.all(
+      suppliers.map(async (supplier) => {
+        // Get product count
+        const productCount = await db('products')
+          .where('supplier_id', supplier.id)
+          .where('is_active', true)
+          .count('* as count')
+          .first();
+
+        // Get total purchase amount
+        const purchaseStats = await db('purchase_orders as po')
+          .join('purchase_order_items as poi', 'po.id', '=', 'poi.purchase_order_id')
+          .where('po.supplier_id', supplier.id)
+          .where('po.organization_id', req.user.organization_id)
+          .sum('poi.total_amount as total_purchase')
+          .first();
+
+        return {
+          ...supplier,
+          product_count: parseInt(productCount.count),
+          total_purchase_amount: parseFloat(purchaseStats.total_purchase) || 0,
+          metadata: supplier.metadata || {}
+        };
+      })
+    );
+
+    // Calculate pagination metadata
+    const totalPages = Math.ceil(totalSuppliers / limit);
+
+    res.json({
+      data: {
+        suppliers: suppliersWithStats,
+        pagination: {
+          current_page: page,
+          per_page: limit,
+          total: totalSuppliers,
+          total_pages: totalPages,
+          has_next_page: page < totalPages,
+          has_prev_page: page > 1
+        }
+      }
+    });
+
+  } catch (error) {
+    console.error('Get suppliers error:', error);
+    res.status(500).json({ 
+      error: 'Failed to fetch suppliers', 
+      message: error.message 
+    });
+  }
+});
+
+// Get single supplier by ID
+router.get('/:id', authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const supplier = await db('suppliers')
+      .where('id', id)
+      .where('organization_id', req.user.organization_id)
+      .first();
+
+    if (!supplier) {
+      return res.status(404).json({ 
+        error: 'Supplier not found' 
+      });
+    }
+
+    // Get supplier statistics
+    const [productCount] = await db('products')
+      .where('supplier_id', id)
+      .where('is_active', true)
+      .count('* as count');
+
+    const purchaseStats = await db('purchase_orders as po')
+      .select(
+        db.raw('COUNT(DISTINCT po.id) as total_orders'),
+        db.raw('SUM(poi.total_amount) as total_spent'),
+        db.raw('AVG(poi.total_amount) as average_order_value')
+      )
+      .join('purchase_order_items as poi', 'po.id', '=', 'poi.purchase_order_id')
+      .where('po.supplier_id', id)
+      .where('po.organization_id', req.user.organization_id)
+      .first();
+
+    // Get recent purchase orders
+    const recentOrders = await db('purchase_orders')
+      .select(
+        'id',
+        'order_number',
+        'order_date',
+        'status',
+        'total_amount',
+        'expected_delivery_date'
+      )
+      .where('supplier_id', id)
+      .where('organization_id', req.user.organization_id)
+      .orderBy('order_date', 'desc')
+      .limit(5);
+
+    res.json({
+      data: {
+        supplier: {
+          ...supplier,
+          statistics: {
+            product_count: parseInt(productCount.count),
+            total_orders: parseInt(purchaseStats.total_orders) || 0,
+            total_spent: parseFloat(purchaseStats.total_spent) || 0,
+            average_order_value: parseFloat(purchaseStats.average_order_value) || 0
+          },
+          recent_orders: recentOrders,
+          metadata: supplier.metadata || {}
+        }
+      }
+    });
+
+  } catch (error) {
+    console.error('Get supplier error:', error);
+    res.status(500).json({ 
+      error: 'Failed to fetch supplier', 
+      message: error.message 
+    });
+  }
+});
+
+// Create new supplier
+router.post('/', authMiddleware, [
+  body('name').notEmpty().withMessage('Supplier name is required'),
+  body('contact_person').optional().isLength({ max: 100 }).withMessage('Contact person name too long'),
+  body('email').optional().isEmail().withMessage('Valid email is required'),
+  body('phone').optional().isLength({ max: 20 }).withMessage('Phone number too long'),
+  body('website').optional().isURL().withMessage('Valid website URL required'),
+  body('payment_terms_days').optional().isInt({ min: 1, max: 365 }).withMessage('Payment terms must be 1-365 days')
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ 
+        error: 'Validation failed', 
+        details: errors.array() 
+      });
+    }
+
+    const {
+      name,
+      contact_person,
+      email,
+      phone,
+      address,
+      website,
+      payment_terms_days,
+      metadata
+    } = req.body;
+
+    // Check if supplier name already exists
+    const existingSupplier = await db('suppliers')
+      .where('organization_id', req.user.organization_id)
+      .where('name', name)
+      .first();
+
+    if (existingSupplier) {
+      return res.status(400).json({ 
+        error: 'A supplier with this name already exists' 
+      });
+    }
+
+    const supplierData = {
+      organization_id: req.user.organization_id,
+      name,
+      contact_person,
+      email,
+      phone,
+      address,
+      website,
+      payment_terms_days: payment_terms_days || 30,
+      metadata: metadata || {},
+      is_active: true
+    };
+
+    const [supplier] = await db('suppliers')
+      .insert(supplierData)
+      .returning('*');
+
+    res.status(201).json({
+      message: 'Supplier created successfully',
+      data: { supplier }
+    });
+
+  } catch (error) {
+    console.error('Create supplier error:', error);
+    res.status(500).json({ 
+      error: 'Failed to create supplier', 
+      message: error.message 
+    });
+  }
+});
+
+// Update supplier
+router.put('/:id', authMiddleware, [
+  body('name').optional().notEmpty().withMessage('Supplier name cannot be empty'),
+  body('email').optional().isEmail().withMessage('Valid email is required'),
+  body('phone').optional().isLength({ max: 20 }).withMessage('Phone number too long'),
+  body('website').optional().isURL().withMessage('Valid website URL required')
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ 
+        error: 'Validation failed', 
+        details: errors.array() 
+      });
+    }
+
+    const { id } = req.params;
+    const {
+      name,
+      contact_person,
+      email,
+      phone,
+      address,
+      website,
+      payment_terms_days,
+      metadata,
+      is_active
+    } = req.body;
+
+    // Check if supplier exists and belongs to user's organization
+    const existingSupplier = await db('suppliers')
+      .where('id', id)
+      .where('organization_id', req.user.organization_id)
+      .first();
+
+    if (!existingSupplier) {
+      return res.status(404).json({ 
+        error: 'Supplier not found' 
+      });
+    }
+
+    // Check if name is unique (if changed)
+    if (name && name !== existingSupplier.name) {
+      const nameExists = await db('suppliers')
+        .where('name', name)
+        .where('organization_id', req.user.organization_id)
+        .where('id', '!=', id)
+        .first();
+
+      if (nameExists) {
+        return res.status(400).json({ 
+          error: 'A supplier with this name already exists' 
+        });
+      }
+    }
+
+    const updateData = {};
+    if (name !== undefined) updateData.name = name;
+    if (contact_person !== undefined) updateData.contact_person = contact_person;
+    if (email !== undefined) updateData.email = email;
+    if (phone !== undefined) updateData.phone = phone;
+    if (address !== undefined) updateData.address = address;
+    if (website !== undefined) updateData.website = website;
+    if (payment_terms_days !== undefined) updateData.payment_terms_days = payment_terms_days;
+    if (metadata !== undefined) updateData.metadata = metadata;
+    if (is_active !== undefined) updateData.is_active = is_active;
+
+    updateData.updated_at = new Date();
+
+    await db('suppliers')
+      .where('id', id)
+      .update(updateData);
+
+    const updatedSupplier = await db('suppliers')
+      .where('id', id)
+      .first();
+
+    res.json({
+      message: 'Supplier updated successfully',
+      data: { supplier: updatedSupplier }
+    });
+
+  } catch (error) {
+    console.error('Update supplier error:', error);
+    res.status(500).json({ 
+      error: 'Failed to update supplier', 
+      message: error.message 
+    });
+  }
+});
+
+// Delete supplier (soft delete)
+router.delete('/:id', authMiddleware, authorize('admin', 'manager'), async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const supplier = await db('suppliers')
+      .where('id', id)
+      .where('organization_id', req.user.organization_id)
+      .first();
+
+    if (!supplier) {
+      return res.status(404).json({ 
+        error: 'Supplier not found' 
+      });
+    }
+
+    // Check if supplier has associated purchase orders
+    const poCount = await db('purchase_orders')
+      .where('supplier_id', id)
+      .count('* as count')
+      .first();
+
+    if (parseInt(poCount.count) > 0) {
+      // Soft delete - just mark as inactive
+      await db('suppliers')
+        .where('id', id)
+        .update({ 
+          is_active: false,
+          updated_at: new Date()
+        });
+
+      res.json({
+        message: 'Supplier deactivated (has existing purchase orders)',
+        data: { deactivated: true }
+      });
+    } else {
+      // Hard delete if no purchase orders
+      await db('suppliers')
+        .where('id', id)
+        .del();
+
+      res.json({
+        message: 'Supplier deleted successfully',
+        data: { deleted: true }
+      });
+    }
+
+  } catch (error) {
+    console.error('Delete supplier error:', error);
+    res.status(500).json({ 
+      error: 'Failed to delete supplier', 
+      message: error.message 
+    });
+  }
+});
+
+// Get supplier products
+router.get('/:id/products', authMiddleware, [
+  query('page').optional().isInt({ min: 1 }).withMessage('Page must be positive integer'),
+  query('limit').optional().isInt({ min: 1, max: 100 }).withMessage('Limit must be 1-100')
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ 
+        error: 'Validation failed', 
+        details: errors.array() 
+      });
+    }
+
+    const { id } = req.params;
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 20;
+    const offset = (page - 1) * limit;
+
+    // Verify supplier exists and belongs to user's organization
+    const supplier = await db('suppliers')
+      .where('id', id)
+      .where('organization_id', req.user.organization_id)
+      .first();
+
+    if (!supplier) {
+      return res.status(404).json({ 
+        error: 'Supplier not found' 
+      });
+    }
+
+    let query = db('products as p')
+      .select(
+        'p.id',
+        'p.sku',
+        'p.name',
+        'p.description',
+        'p.cost_price',
+        'p.selling_price',
+        'p.min_stock_level',
+        'p.is_active',
+        'p.created_at',
+        db.raw('COALESCE(stock_summary.current_stock, 0) as current_stock')
+      )
+      .leftJoin(
+        db.raw(`
+          (SELECT 
+            product_id, 
+            SUM(CASE WHEN quantity > 0 THEN quantity ELSE 0 END) as current_stock
+          FROM inventory_transactions 
+          WHERE organization_id = ?
+          GROUP BY product_id) as stock_summary
+        `),
+        'p.id', '=', 'stock_summary.product_id'
+      )
+      .where('p.supplier_id', id)
+      .where('p.organization_id', req.user.organization_id);
+
+    // Get total count
+    const countQuery = query.clone().count('p.id as total');
+    const [{ total }] = await countQuery;
+    const totalProducts = parseInt(total);
+
+    // Apply pagination and ordering
+    query = query
+      .orderBy('p.name', 'asc')
+      .limit(limit)
+      .offset(offset);
+
+    const products = await query;
+
+    // Calculate pagination metadata
+    const totalPages = Math.ceil(totalProducts / limit);
+
+    res.json({
+      data: {
+        products,
+        supplier: {
+          id: supplier.id,
+          name: supplier.name
+        },
+        pagination: {
+          current_page: page,
+          per_page: limit,
+          total: totalProducts,
+          total_pages: totalPages,
+          has_next_page: page < totalPages,
+          has_prev_page: page > 1
+        }
+      }
+    });
+
+  } catch (error) {
+    console.error('Get supplier products error:', error);
+    res.status(500).json({ 
+      error: 'Failed to fetch supplier products', 
+      message: error.message 
+    });
+  }
+});
+
+module.exports = router;

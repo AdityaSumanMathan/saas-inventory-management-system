@@ -1,0 +1,110 @@
+/**
+ * @param { import("knex").Knex } knex
+ * @returns { Promise<void> }
+ */
+exports.up = function(knex) {
+  return knex.schema
+    // Purchase Orders table
+    .createTable('purchase_orders', function(table) {
+      table.uuid('id').primary().defaultTo(knex.raw('gen_random_uuid()'));
+      table.uuid('organization_id').references('id').inTable('organizations').onDelete('CASCADE');
+      table.uuid('supplier_id').references('id').inTable('suppliers').onDelete('CASCADE');
+      table.string('order_number').notNullable().unique();
+      table.date('order_date').notNullable();
+      table.enum('status', ['draft', 'sent', 'confirmed', 'partially_received', 'received', 'cancelled']).defaultTo('draft');
+      table.decimal('total_amount', 12, 2).defaultTo(0);
+      table.date('expected_delivery_date');
+      table.text('notes');
+      table.timestamps(true, true);
+    })
+
+    // Purchase Order Items table
+    .createTable('purchase_order_items', function(table) {
+      table.uuid('id').primary().defaultTo(knex.raw('gen_random_uuid()'));
+      table.uuid('purchase_order_id').references('id').inTable('purchase_orders').onDelete('CASCADE');
+      table.uuid('product_id').references('id').inTable('products').onDelete('CASCADE');
+      table.decimal('quantity', 12, 3).notNullable();
+      table.decimal('unit_price', 10, 2).notNullable();
+      table.decimal('total_amount', 12, 2).notNullable();
+      table.timestamps(true, true);
+    })
+
+    // Purchase Receipts table (for tracking received goods)
+    .createTable('purchase_receipts', function(table) {
+      table.uuid('id').primary().defaultTo(knex.raw('gen_random_uuid()'));
+      table.uuid('organization_id').references('id').inTable('organizations').onDelete('CASCADE');
+      table.uuid('purchase_order_id').references('id').inTable('purchase_orders').onDelete('CASCADE');
+      table.uuid('purchase_order_item_id').references('id').inTable('purchase_order_items').onDelete('CASCADE');
+      table.uuid('user_id').references('id').inTable('users').onDelete('SET NULL');
+      table.decimal('quantity', 12, 3).notNullable();
+      table.decimal('unit_price', 10, 2).notNullable();
+      table.decimal('total_amount', 12, 2).notNullable();
+      table.date('received_date').notNullable();
+      table.text('notes');
+      table.timestamps(true, true);
+    })
+
+    // API Usage Log table (for tracking subscription limits)
+    .createTable('api_usage_logs', function(table) {
+      table.uuid('id').primary().defaultTo(knex.raw('gen_random_uuid()'));
+      table.uuid('organization_id').references('id').inTable('organizations').onDelete('CASCADE');
+      table.uuid('user_id').references('id').inTable('users').onDelete('SET NULL');
+      table.string('endpoint').notNullable();
+      table.string('method').notNullable();
+      table.integer('response_code');
+      table.integer('response_time_ms');
+      table.json('request_data');
+      table.json('response_data');
+      table.timestamp('created_at').defaultTo(knex.fn.now());
+    })
+
+    // Notification Preferences table
+    .createTable('notification_preferences', function(table) {
+      table.uuid('id').primary().defaultTo(knex.raw('gen_random_uuid()'));
+      table.uuid('organization_id').references('id').inTable('organizations').onDelete('CASCADE');
+      table.uuid('user_id').references('id').inTable('users').onDelete('CASCADE');
+      table.boolean('low_stock_alerts').defaultTo(true);
+      table.boolean('order_updates').defaultTo(true);
+      table.boolean('system_notifications').defaultTo(true);
+      table.boolean('email_notifications').defaultTo(true);
+      table.boolean('sms_notifications').defaultTo(false);
+      table.timestamps(true, true);
+    })
+    .unique(['organization_id', 'user_id'])
+
+    // Add columns to organizations table for Stripe integration
+    .table('organizations', function(table) {
+      table.string('stripe_customer_id');
+      table.string('stripe_subscription_id');
+    });
+
+  // Add indexes for performance
+  return knex.schema
+    .raw('CREATE INDEX idx_purchase_orders_organization_id ON purchase_orders(organization_id)')
+    .raw('CREATE INDEX idx_purchase_orders_supplier_id ON purchase_orders(supplier_id)')
+    .raw('CREATE INDEX idx_purchase_orders_status ON purchase_orders(status)')
+    .raw('CREATE INDEX idx_purchase_order_items_purchase_order_id ON purchase_order_items(purchase_order_id)')
+    .raw('CREATE INDEX idx_purchase_order_items_product_id ON purchase_order_items(product_id)')
+    .raw('CREATE INDEX idx_purchase_receipts_purchase_order_id ON purchase_receipts(purchase_order_id)')
+    .raw('CREATE INDEX idx_purchase_receipts_organization_id ON purchase_receipts(organization_id)')
+    .raw('CREATE INDEX idx_api_usage_logs_organization_id ON api_usage_logs(organization_id)')
+    .raw('CREATE INDEX idx_api_usage_logs_created_at ON api_usage_logs(created_at)')
+    .raw('CREATE INDEX idx_notification_preferences_organization_id ON notification_preferences(organization_id)');
+};
+
+/**
+ * @param { import("knex").Knex } knex
+ * @returns { Promise<void> }
+ */
+exports.down = function(knex) {
+  return knex.schema
+    .dropTableIfExists('notification_preferences')
+    .dropTableIfExists('api_usage_logs')
+    .dropTableIfExists('purchase_receipts')
+    .dropTableIfExists('purchase_order_items')
+    .dropTableIfExists('purchase_orders')
+    .table('organizations', function(table) {
+      table.dropColumn('stripe_customer_id');
+      table.dropColumn('stripe_subscription_id');
+    });
+};
